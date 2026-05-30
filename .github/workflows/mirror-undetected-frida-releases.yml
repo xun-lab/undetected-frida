@@ -1,0 +1,181 @@
+name: Mirror undetected-frida releases
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: Source repository
+        required: true
+        default: zer0def/undetected-frida
+      only_tag:
+        description: Optional single release tag to sync
+        required: false
+        default: ""
+      delete_asset_before_upload:
+        description: Delete same-name target asset before upload
+        required: false
+        default: "false"
+
+permissions:
+  contents: write
+
+jobs:
+  mirror-releases:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mirror releases and assets
+        uses: actions/github-script@v8
+        env:
+          SOURCE_REPO: ${{ inputs.source_repo }}
+          ONLY_TAG: ${{ inputs.only_tag }}
+          DELETE_ASSET_BEFORE_UPLOAD: ${{ inputs.delete_asset_before_upload }}
+        with:
+          script: |
+            const fs = require("fs");
+            const os = require("os");
+            const path = require("path");
+            const crypto = require("crypto");
+
+            const [sourceOwner, sourceRepo] = process.env.SOURCE_REPO.split("/");
+            if (!sourceOwner || !sourceRepo) {
+              throw new Error(`Invalid SOURCE_REPO: ${process.env.SOURCE_REPO}`);
+            }
+
+            const targetOwner = context.repo.owner;
+            const targetRepo = context.repo.repo;
+            const onlyTag = process.env.ONLY_TAG.trim();
+            const deleteBeforeUpload = process.env.DELETE_ASSET_BEFORE_UPLOAD === "true";
+
+            async function listAll(endpoint, params) {
+              return await github.paginate(endpoint, { per_page: 100, ...params });
+            }
+
+            async function getTargetReleaseByTag(tag) {
+              try {
+                return (await github.rest.repos.getReleaseByTag({
+                  owner: targetOwner,
+                  repo: targetRepo,
+                  tag,
+                })).data;
+              } catch (error) {
+                if (error.status === 404) return null;
+                throw error;
+              }
+            }
+
+            async function ensureTargetRelease(sourceRelease) {
+              const existing = await getTargetReleaseByTag(sourceRelease.tag_name);
+              if (existing) {
+                core.info(`[release] exists: ${sourceRelease.tag_name}`);
+                return existing;
+              }
+
+              core.info(`[release] create: ${sourceRelease.tag_name}`);
+              return (await github.rest.repos.createRelease({
+                owner: targetOwner,
+                repo: targetRepo,
+                tag_name: sourceRelease.tag_name,
+                target_commitish: sourceRelease.target_commitish || undefined,
+                name: sourceRelease.name || sourceRelease.tag_name,
+                body: sourceRelease.body || "",
+                draft: sourceRelease.draft,
+                prerelease: sourceRelease.prerelease,
+              })).data;
+            }
+
+            async function downloadAsset(asset, outPath) {
+              core.info(`[asset] download: ${asset.name}`);
+              const response = await github.request("GET /repos/{owner}/{repo}/releases/assets/{asset_id}", {
+                owner: sourceOwner,
+                repo: sourceRepo,
+                asset_id: asset.id,
+                headers: { accept: "application/octet-stream" },
+              });
+
+              const buffer = Buffer.from(response.data);
+              fs.writeFileSync(outPath, buffer);
+
+              if (buffer.length !== asset.size) {
+                throw new Error(`Size mismatch for ${asset.name}: got ${buffer.length}, expected ${asset.size}`);
+              }
+
+              if (asset.digest && asset.digest.startsWith("sha256:")) {
+                const actual = crypto.createHash("sha256").update(buffer).digest("hex");
+                const expected = asset.digest.slice("sha256:".length).toLowerCase();
+                if (actual !== expected) {
+                  throw new Error(`SHA256 mismatch for ${asset.name}: got ${actual}, expected ${expected}`);
+                }
+              }
+            }
+
+            async function uploadAsset(targetRelease, filePath, assetName) {
+              const stat = fs.statSync(filePath);
+              const data = fs.readFileSync(filePath);
+              await github.rest.repos.uploadReleaseAsset({
+                owner: targetOwner,
+                repo: targetRepo,
+                release_id: targetRelease.id,
+                name: assetName,
+                data,
+                headers: {
+                  "content-type": "application/octet-stream",
+                  "content-length": stat.size,
+                },
+              });
+            }
+
+            const releases = await listAll(github.rest.repos.listReleases, {
+              owner: sourceOwner,
+              repo: sourceRepo,
+            });
+
+            core.info(`[release] source count: ${releases.length}`);
+
+            for (const release of releases) {
+              if (onlyTag && release.tag_name !== onlyTag) continue;
+
+              core.info("");
+              core.info(`[release] sync: ${release.tag_name}`);
+              const sourceAssets = await listAll(github.rest.repos.listReleaseAssets, {
+                owner: sourceOwner,
+                repo: sourceRepo,
+                release_id: release.id,
+              });
+              const targetRelease = await ensureTargetRelease(release);
+              const targetAssets = await listAll(github.rest.repos.listReleaseAssets, {
+                owner: targetOwner,
+                repo: targetRepo,
+                release_id: targetRelease.id,
+              });
+              const targetByName = new Map(targetAssets.map(asset => [asset.name, asset]));
+
+              const workDir = fs.mkdtempSync(path.join(os.tmpdir(), `mirror-${release.tag_name}-`));
+              try {
+                for (const asset of sourceAssets) {
+                  const existingAsset = targetByName.get(asset.name);
+                  if (existingAsset && !deleteBeforeUpload) {
+                    core.info(`[asset] target already has: ${release.tag_name}/${asset.name}`);
+                    continue;
+                  }
+
+                  if (existingAsset && deleteBeforeUpload) {
+                    core.info(`[asset] delete target copy: ${release.tag_name}/${asset.name}`);
+                    await github.rest.repos.deleteReleaseAsset({
+                      owner: targetOwner,
+                      repo: targetRepo,
+                      asset_id: existingAsset.id,
+                    });
+                  }
+
+                  const filePath = path.join(workDir, asset.name);
+                  await downloadAsset(asset, filePath);
+                  core.info(`[asset] upload: ${release.tag_name}/${asset.name}`);
+                  await uploadAsset(targetRelease, filePath, asset.name);
+                  fs.unlinkSync(filePath);
+                }
+              } finally {
+                fs.rmSync(workDir, { recursive: true, force: true });
+              }
+            }
+
+            core.info("[done] release mirror complete");
